@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__
+*.pyc
+output/
+logs/
+misc/
+environment.yml
+.gitignore
+*.md
+LICENSE
+.dockerignore
