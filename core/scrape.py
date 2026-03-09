@@ -402,7 +402,7 @@ class Scrape:
                                 review_text_disliked = self._validate(review_text[2])
 
                 # Add '.' period sign to the end of each part of the review. If its not already there
-                t_title = f"title: {review_title}" if review_title else ""
+                t_title = f"{review_title}" if review_title else ""
                 t_title = (
                     f"{t_title}."
                     if t_title and t_title[-1] not in string.punctuation
