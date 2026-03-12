@@ -1,4 +1,5 @@
 beautifulsoup4==4.12.2
+cloudscraper==1.2.71
 numpy==1.26.2
 pydantic==2.4.2
 python_dateutil==2.8.2

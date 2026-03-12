@@ -13,6 +13,7 @@ from typing import List, Union
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
+import cloudscraper
 import requests
 import yaml
 from bs4 import BeautifulSoup
@@ -21,8 +22,17 @@ from dateutil import parser
 from core.data_models import Config, Input, sort_by_map
 
 PROCESS_POOL_SIZE = 5
-safari_user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
-headers = {"User-Agent": safari_user_agent}
+
+# Create a cloudscraper session that handles WAF/bot challenges
+# and sends realistic browser headers (TLS fingerprint, headers order, etc.)
+scraper = cloudscraper.create_scraper(
+    browser={
+        "browser": "chrome",
+        "platform": "darwin",
+        "desktop": True,
+    },
+    delay=5,  # wait up to 5 seconds for JS challenge resolution
+)
 
 
 class Scrape:
@@ -163,14 +173,13 @@ class Scrape:
         """
         self.logger.info("Checking max offset parameter value")
 
-        r = requests.get(
+        r = scraper.get(
             self._config.HOTEL_REVIEWS_PAGE,
             params={
                 "cc1": self.input_params.country,
                 "pagename": self.input_params.hotel_name,
                 "rows": 10,
             },
-            headers=headers,
         )
 
         soup = BeautifulSoup(r.content.decode(), "html.parser")
@@ -270,13 +279,16 @@ class Scrape:
 
         retry_count = 1
         while retry_count <= self._config.MAX_RETIES:
-            response = requests.get(url, headers=headers)
+            response = scraper.get(url)
 
             if response.status_code == 200:
                 break
 
             else:
-                self.logger.warning(f"Retrying {retry_count} ... {url}")
+                self.logger.warning(
+                    f"Retrying {retry_count} (status={response.status_code}) ... {url}"
+                )
+                time.sleep(retry_count * 2)  # exponential backoff between retries
                 retry_count += 1
                 continue
 
