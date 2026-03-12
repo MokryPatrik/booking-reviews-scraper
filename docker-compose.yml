@@ -5,6 +5,7 @@ services:
       - "${PORT:-8000}:${PORT:-8000}"
     environment:
       - PORT=${PORT:-8000}
+      - PROXY_URL=${PROXY_URL:-}
     volumes:
       - ./output:/app/output
       - ./logs:/app/logs

@@ -13,8 +13,8 @@ from typing import List, Union
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
-import cloudscraper
 import requests
+import urllib3
 import yaml
 from bs4 import BeautifulSoup
 from dateutil import parser
@@ -23,16 +23,30 @@ from core.data_models import Config, Input, sort_by_map
 
 PROCESS_POOL_SIZE = 5
 
-# Create a cloudscraper session that handles WAF/bot challenges
-# and sends realistic browser headers (TLS fingerprint, headers order, etc.)
-scraper = cloudscraper.create_scraper(
-    browser={
-        "browser": "chrome",
-        "platform": "darwin",
-        "desktop": True,
-    },
-    delay=5,  # wait up to 5 seconds for JS challenge resolution
-)
+# Suppress SSL warnings when using Web Unblocker proxy (requires verify=False)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _create_session():
+    """Create a requests session with optional Web Unblocker proxy support.
+
+    Set the PROXY_URL env var to route requests through a proxy:
+        export PROXY_URL="http://user:pass@unblocker.iproyal.com:12323"
+    """
+    s = requests.Session()
+    s.verify = False  # Web Unblocker uses its own SSL handling
+
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        s.proxies = {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+
+    return s
+
+
+session = _create_session()
 
 
 class Scrape:
@@ -48,6 +62,13 @@ class Scrape:
 
         self._config = self._load_config()
         self.input_params = Input(**input)
+
+        proxy_url = os.environ.get("PROXY_URL")
+        if proxy_url:
+            # Mask credentials in log output
+            self.logger.info(f"Using proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
+        else:
+            self.logger.warning("No PROXY_URL set — requests will use direct connection")
 
         # the below property is for the purpose of monitoring progress
         # It contains the parsed reviews of processed pages and their idx
@@ -173,7 +194,7 @@ class Scrape:
         """
         self.logger.info("Checking max offset parameter value")
 
-        r = scraper.get(
+        r = session.get(
             self._config.HOTEL_REVIEWS_PAGE,
             params={
                 "cc1": self.input_params.country,
@@ -279,7 +300,7 @@ class Scrape:
 
         retry_count = 1
         while retry_count <= self._config.MAX_RETIES:
-            response = scraper.get(url)
+            response = session.get(url)
 
             if response.status_code == 200:
                 break
