@@ -1,7 +1,6 @@
 import concurrent.futures
 import csv
 import logging
-import multiprocessing as mp
 import os
 import re
 import string
@@ -12,7 +11,6 @@ from datetime import datetime
 from typing import List, Union
 from urllib.parse import parse_qs, urlparse
 
-import numpy as np
 import requests
 import urllib3
 import yaml
@@ -21,7 +19,8 @@ from dateutil import parser
 
 from core.data_models import Config, Input, sort_by_map
 
-PROCESS_POOL_SIZE = 5
+# Timeout in seconds for HTTP requests to prevent hung threads
+REQUEST_TIMEOUT = 30
 
 # Suppress SSL warnings when using Web Unblocker proxy (requires verify=False)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -58,7 +57,7 @@ class Scrape:
             self.logger = logger
         else:
             self._get_logger()
-            self.logger = logging.getLogger()
+            self.logger = logging.getLogger(f"booking_parser.{os.getenv('job_id', 'default')}")
 
         self._config = self._load_config()
         self.input_params = Input(**input)
@@ -72,12 +71,11 @@ class Scrape:
 
         # the below property is for the purpose of monitoring progress
         # It contains the parsed reviews of processed pages and their idx
-        self._parsed_pages_reviews = (
-            mp.Manager().list()
-        )  # It will contians the list of reviews for each page
+        self._parsed_pages_reviews = []  # list of reviews for each page
+        self._lock = threading.Lock()  # protects _parsed_pages_reviews
         self._execution_finished = (
-            mp.Event()
-        )  # set this event when execution if finished
+            threading.Event()
+        )  # set this event when execution is finished
 
         st_ = ""
         for key, value in self.input_params.model_dump().items():
@@ -99,23 +97,26 @@ class Scrape:
         file_path = f"logs/{os.getenv('job_id')}.log"
         frmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-        logger = logging.getLogger()
+        # Use a named logger to avoid polluting the root logger
+        logger = logging.getLogger(f"booking_parser.{os.getenv('job_id', 'default')}")
         logger.setLevel(logging.INFO)
 
-        # Log to console
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter(frmt)
-        console_handler.setFormatter(console_formatter)
+        # Only add handlers if this logger doesn't already have them
+        if not logger.handlers:
+            # Log to console
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+            console_formatter = logging.Formatter(frmt)
+            console_handler.setFormatter(console_formatter)
 
-        # Log to file
-        file_handler = logging.FileHandler(file_path)
-        file_handler.setLevel(logging.INFO)
-        file_formatter = logging.Formatter(frmt)
-        file_handler.setFormatter(file_formatter)
+            # Log to file
+            file_handler = logging.FileHandler(file_path)
+            file_handler.setLevel(logging.INFO)
+            file_formatter = logging.Formatter(frmt)
+            file_handler.setFormatter(file_formatter)
 
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
+            logger.addHandler(console_handler)
+            logger.addHandler(file_handler)
 
     def _progress_thread_start(self, ls_urls: List[dict]):
         """It will keep printing the overall progress
@@ -201,6 +202,7 @@ class Scrape:
                 "pagename": self.input_params.hotel_name,
                 "rows": 10,
             },
+            timeout=REQUEST_TIMEOUT,
         )
 
         soup = BeautifulSoup(r.content.decode(), "html.parser")
@@ -300,7 +302,7 @@ class Scrape:
 
         retry_count = 1
         while retry_count <= self._config.MAX_RETIES:
-            response = session.get(url)
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
 
             if response.status_code == 200:
                 break
@@ -462,7 +464,7 @@ class Scrape:
                 full_review = self._validate(full_review)
                 # ------------------------------------------------
 
-                if "en" in original_lang:
+                if original_lang and "en" in original_lang:
                     en_full_review = full_review
 
                 found_helpful = self._validate(
@@ -525,7 +527,8 @@ class Scrape:
 
             # idx: orginal offset_param value / id of reviews page
             # reviews: list of reviews found on the page
-            self._parsed_pages_reviews.append({"idx": idx, "reviews": page_reviews})
+            with self._lock:
+                self._parsed_pages_reviews.append({"idx": idx, "reviews": page_reviews})
             pages_reviews.append({"idx": idx, "reviews": page_reviews})
 
         return pages_reviews
@@ -534,8 +537,29 @@ class Scrape:
     # ******** Scraping Modes full/partial ********
     ##########################################################
 
+    def _scrape_and_parse(self, url_dict: dict) -> dict:
+        """Fetch a single review page and parse it immediately.
+
+        This avoids holding raw HTML responses in memory — the response
+        is discarded as soon as the page is parsed.
+
+        Args:
+            url_dict: dict containing the url and idx/offset_param
+
+        Returns:
+            dict with idx and parsed reviews list
+        """
+        res_dict = self._scrape(url_dict)
+        parsed = self._parse_scraped_results([res_dict])
+        return parsed[0] if parsed else {"idx": url_dict["idx"], "reviews": []}
+
     def _get_all_reviews(self, ls_urls: List[dict]) -> List[dict]:
-        """Gets all the review till the last page
+        """Gets all the reviews till the last page.
+
+        Uses a ThreadPoolExecutor to fetch and parse each page incrementally.
+        Each page's HTML response is discarded immediately after parsing,
+        keeping peak memory usage proportional to the number of concurrent
+        workers rather than the total number of pages.
 
         Args:
             ls_urls: list containing url and idx/offset_param of each reviews page
@@ -544,65 +568,39 @@ class Scrape:
             list of all the reviews
         """
         _start = time.time()
-        self.logger.info(f"Starting Get Requests on {len(ls_urls)} urls")
+        self.logger.info(f"Starting scrape & parse on {len(ls_urls)} urls")
 
-        # *************START: Send get request to all urls and save the response objects*************
+        parsed_pages = []
 
-        responses = []
-        # Use ThreadPoolExecutor to parallelize GET requests
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self._config.REQUESTS_PER_SECOND
         ) as executor:
-            # Submit tasks for each URL
+            # Submit tasks in rate-limited batches
             futures = []
             cnt = 0
             for url_dict in ls_urls:
-                f = executor.submit(self._scrape, url_dict)
+                f = executor.submit(self._scrape_and_parse, url_dict)
                 futures.append(f)
                 cnt += 1
 
-                if (
-                    cnt >= self._config.REQUESTS_PER_SECOND
-                ):  # submit no more than x requests/per sec
+                if cnt >= self._config.REQUESTS_PER_SECOND:
                     time.sleep(1)
                     cnt = 0
 
-            # futures = [executor.submit(self._scrape, url_dict) for url_dict in ls_urls]
-            # Wait for all tasks to complete
-            concurrent.futures.wait(futures)
-            # Use map to get results in the order of submission
-            responses = list(executor.map(lambda f: f.result(), futures))
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                parsed_pages.append(future.result())
 
-        self.logger.info(f"Finished Get Requests in {time.time() - _start:.1f} seconds")
-
-        # ************* --------END-------- *************
-
-        self.logger.info(f"Starting Parsing Responses: {len(responses)}")
-
-        # *************START: Parse the html content from all response objects*************
-
-        # split the list of response object into multiple splits
-        # and send one list to each process
-        ls_p = []
-        for split in np.array_split(responses, PROCESS_POOL_SIZE):
-            if len(split):
-                p = mp.Process(target=self._parse_scraped_results, args=(split,))
-                p.start()
-                ls_p.append(p)
-
-        self.logger.info(f"Processes launched: {len(ls_p)}")
-        _ = [p.join() for p in ls_p]
-
-        # Sort the list based on the 'idx' key in each dictionary
-        # so that the reviews of the first page, come first
-        ls_reviews = sorted(self._parsed_pages_reviews, key=lambda x: x["idx"])
+        # Sort the list based on the 'idx' key so that the reviews
+        # of the first page come first
+        parsed_pages.sort(key=lambda x: x["idx"])
         result_list = []
-        _ = [result_list.extend(d["reviews"]) for d in ls_reviews]
+        for page in parsed_pages:
+            result_list.extend(page["reviews"])
 
         self.logger.info(
-            f"Finished Parsing Responses: {len(result_list)} in {time.time() - _start:.1f} seconds"
+            f"Finished scrape & parse: {len(result_list)} reviews in {time.time() - _start:.1f} seconds"
         )
-        # ************* --------END-------- *************
 
         return result_list
 

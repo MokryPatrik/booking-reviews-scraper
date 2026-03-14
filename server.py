@@ -1,11 +1,12 @@
 import uuid
 import threading
 import time as time_module
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from core.scrape import Scrape
@@ -32,6 +33,14 @@ app = FastAPI(
 
 # ── In-memory task store ────────────────────────────────────────────────────────
 tasks_store: dict[str, dict] = {}
+_tasks_store_lock = threading.Lock()
+
+# Maximum number of concurrent scrape jobs
+MAX_CONCURRENT_SCRAPES = 4
+_scrape_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_SCRAPES)
+
+# Task TTL: completed/failed tasks are removed after this many seconds (1 hour)
+TASK_TTL_SECONDS = 3600
 
 
 # ── Enums ────────────────────────────────────────────────────────────────────────
@@ -354,9 +363,31 @@ class TasksReadyResponse(BaseModel):
     tasks: List[ReadyTaskRecord] = Field(...)
 
 
+# ── Task cleanup ────────────────────────────────────────────────────────────────
+def _cleanup_expired_tasks() -> int:
+    """Remove completed/failed tasks older than TASK_TTL_SECONDS.
+
+    Returns:
+        Number of tasks removed.
+    """
+    now = time_module.time()
+    expired = []
+    with _tasks_store_lock:
+        for tid, task in tasks_store.items():
+            finished_at = task.get("_finished_at")
+            if finished_at and (now - finished_at) > TASK_TTL_SECONDS:
+                expired.append(tid)
+        for tid in expired:
+            del tasks_store[tid]
+    return len(expired)
+
+
 # ── Background scraping worker ──────────────────────────────────────────────────
 def _run_scrape(task_id: str, params: dict) -> None:
     """Execute the scraping job in a background thread."""
+    # Clean up expired tasks before starting new work
+    _cleanup_expired_tasks()
+
     start = time_module.perf_counter()
     try:
         input_params = {
@@ -370,38 +401,42 @@ def _run_scrape(task_id: str, params: dict) -> None:
         reviews = s.run()
         elapsed = f"{time_module.perf_counter() - start:.4f} sec."
 
-        tasks_store[task_id].update(
-            {
-                "status_code": 20000,
-                "status_message": "Ok.",
-                "time": elapsed,
-                "result_count": 1,
-                "result": [
-                    {
-                        "hotel_name": params["hotel_name"],
-                        "country": params["country"].lower(),
-                        "type": "booking_reviews",
-                        "datetime": datetime.now(timezone.utc).strftime(
-                            "%Y-%m-%d %H:%M:%S +00:00"
-                        ),
-                        "reviews_count": len(reviews),
-                        "items_count": len(reviews),
-                        "items": reviews,
-                    }
-                ],
-            }
-        )
+        with _tasks_store_lock:
+            tasks_store[task_id].update(
+                {
+                    "status_code": 20000,
+                    "status_message": "Ok.",
+                    "time": elapsed,
+                    "result_count": 1,
+                    "_finished_at": time_module.time(),
+                    "result": [
+                        {
+                            "hotel_name": params["hotel_name"],
+                            "country": params["country"].lower(),
+                            "type": "booking_reviews",
+                            "datetime": datetime.now(timezone.utc).strftime(
+                                "%Y-%m-%d %H:%M:%S +00:00"
+                            ),
+                            "reviews_count": len(reviews),
+                            "items_count": len(reviews),
+                            "items": reviews,
+                        }
+                    ],
+                }
+            )
     except Exception as e:
         elapsed = f"{time_module.perf_counter() - start:.4f} sec."
-        tasks_store[task_id].update(
-            {
-                "status_code": 50000,
-                "status_message": f"Error: {e}",
-                "time": elapsed,
-                "result_count": 0,
-                "result": None,
-            }
-        )
+        with _tasks_store_lock:
+            tasks_store[task_id].update(
+                {
+                    "status_code": 50000,
+                    "status_message": f"Error: {e}",
+                    "time": elapsed,
+                    "result_count": 0,
+                    "_finished_at": time_module.time(),
+                    "result": None,
+                }
+            )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────
@@ -475,14 +510,10 @@ def task_post(items: List[TaskPostItem]):
             "result": None,
         }
 
-        tasks_store[task_id] = task_record.copy()
+        with _tasks_store_lock:
+            tasks_store[task_id] = task_record.copy()
 
-        thread = threading.Thread(
-            target=_run_scrape,
-            args=(task_id, item.model_dump()),
-            daemon=True,
-        )
-        thread.start()
+        _scrape_pool.submit(_run_scrape, task_id, item.model_dump())
 
         created_tasks.append(task_record)
 
@@ -504,15 +535,16 @@ def task_post(items: List[TaskPostItem]):
 )
 def tasks_ready():
     ready = []
-    for tid, task in tasks_store.items():
-        if task.get("status_code") == 20000:
-            ready.append(
-                {
-                    "id": tid,
-                    "tag": task.get("data", {}).get("tag"),
-                    "endpoint": f"/v3/reviews/task_get/{tid}",
-                }
-            )
+    with _tasks_store_lock:
+        for tid, task in tasks_store.items():
+            if task.get("status_code") == 20000:
+                ready.append(
+                    {
+                        "id": tid,
+                        "tag": task.get("data", {}).get("tag"),
+                        "endpoint": f"/v3/reviews/task_get/{tid}",
+                    }
+                )
 
     return _build_response(
         [
@@ -567,7 +599,22 @@ def tasks_ready():
         },
     },
 )
-def task_get(task_id: str):
+def task_get(
+    task_id: str,
+    limit: int = Query(
+        default=0,
+        ge=0,
+        description=(
+            "Maximum number of review items to return. "
+            "Use `0` (default) to return all items."
+        ),
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="Number of review items to skip before returning results.",
+    ),
+):
     task = tasks_store.get(task_id)
     if not task:
         return _build_response(
@@ -576,6 +623,34 @@ def task_get(task_id: str):
             status_code=40401,
             status_message="Task Not Found.",
         )
+
+    result = task.get("result")
+
+    # Apply pagination to review items if the task has results
+    if result and limit > 0:
+        paginated_result = []
+        for r in result:
+            r_copy = dict(r)
+            items = r_copy.get("items", [])
+            total = len(items)
+            sliced = items[offset : offset + limit]
+            r_copy["items"] = sliced
+            r_copy["items_count"] = len(sliced)
+            r_copy["total_count"] = total
+            paginated_result.append(r_copy)
+        result = paginated_result
+    elif result and offset > 0:
+        paginated_result = []
+        for r in result:
+            r_copy = dict(r)
+            items = r_copy.get("items", [])
+            total = len(items)
+            sliced = items[offset:]
+            r_copy["items"] = sliced
+            r_copy["items_count"] = len(sliced)
+            r_copy["total_count"] = total
+            paginated_result.append(r_copy)
+        result = paginated_result
 
     return _build_response(
         [
@@ -588,7 +663,7 @@ def task_get(task_id: str):
                 "result_count": task.get("result_count", 0),
                 "path": ["v3", "reviews", "task_get", task_id],
                 "data": task["data"],
-                "result": task.get("result"),
+                "result": result,
             }
         ]
     )

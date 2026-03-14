@@ -69,7 +69,7 @@ dependencies:
   - markdown-it-py==3.0.0
   - mdurl==0.1.2
   - mypy_extensions==1.0.0
-  - numpy==1.26.4
+
   - pathspec==0.11.2
   - pipreqs==0.4.13
   - py==1.11.0
