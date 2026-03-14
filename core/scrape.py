@@ -294,7 +294,7 @@ class Scrape:
             url_dict: dict containing the urls and idx/offset_param of the current url/page
 
         Returns:
-            response object
+            dict with idx and response object (response may be None on failure)
         """
         response = None
         url = url_dict["url"]  # url of the reviews page
@@ -302,18 +302,23 @@ class Scrape:
 
         retry_count = 1
         while retry_count <= self._config.MAX_RETIES:
-            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            try:
+                response = session.get(url, timeout=REQUEST_TIMEOUT)
 
-            if response.status_code == 200:
-                break
+                if response.status_code == 200:
+                    break
 
-            else:
                 self.logger.warning(
                     f"Retrying {retry_count} (status={response.status_code}) ... {url}"
                 )
-                time.sleep(retry_count * 2)  # exponential backoff between retries
-                retry_count += 1
-                continue
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(
+                    f"Retrying {retry_count} ({type(e).__name__}: {e}) ... {url}"
+                )
+                response = None
+
+            time.sleep(retry_count * 2)  # exponential backoff between retries
+            retry_count += 1
 
         return {"idx": idx, "response": response}
 
@@ -360,6 +365,12 @@ class Scrape:
             response: requests.Response = response_dict[
                 "response"
             ]  # current response object
+
+            # Skip pages where the request failed after all retries
+            if response is None:
+                self.logger.warning(f"Skipping page idx={idx} — request failed after all retries")
+                pages_reviews.append({"idx": idx, "reviews": []})
+                continue
 
             soup = BeautifulSoup(response.content.decode(), "html.parser")
             reviews = soup.select("ul.review_list > li")
@@ -587,9 +598,14 @@ class Scrape:
                     time.sleep(1)
                     cnt = 0
 
-            # Collect results as they complete
+            # Collect results as they complete — failed pages are skipped
+            failed_count = 0
             for future in concurrent.futures.as_completed(futures):
-                parsed_pages.append(future.result())
+                try:
+                    parsed_pages.append(future.result())
+                except Exception as e:
+                    failed_count += 1
+                    self.logger.warning(f"Page failed: {type(e).__name__}: {e}")
 
         # Sort the list based on the 'idx' key so that the reviews
         # of the first page come first
@@ -598,9 +614,10 @@ class Scrape:
         for page in parsed_pages:
             result_list.extend(page["reviews"])
 
-        self.logger.info(
-            f"Finished scrape & parse: {len(result_list)} reviews in {time.time() - _start:.1f} seconds"
-        )
+        msg = f"Finished scrape & parse: {len(result_list)} reviews in {time.time() - _start:.1f} seconds"
+        if failed_count:
+            msg += f" ({failed_count} page(s) failed)"
+        self.logger.info(msg)
 
         return result_list
 
